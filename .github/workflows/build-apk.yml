@@ -1,0 +1,114 @@
+# ============================================================
+#  零基础版：云端打包 APK
+#  在仓库里新建 .github/workflows/build-apk.yml，把本文件内容整段粘进去即可。
+#  它会在构建前自动修复仓库里 3 处会导致失败的配置，你不需要改任何其他文件。
+# ============================================================
+name: 云端打包 APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 取回代码
+        uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: 安装 Flutter 3.24.5
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: 自动修复仓库配置
+        run: |
+          set -e
+          echo "::group::① 修 settings.gradle 里写死的外部 Flutter SDK 路径"
+          cat > android/settings.gradle <<'GRADLE'
+          pluginManagement {
+              def flutterSdkPath = {
+                  def properties = new Properties()
+                  file("local.properties").withInputStream { properties.load(it) }
+                  def sdkPath = properties.getProperty("flutter.sdk")
+                  assert sdkPath != null, "flutter.sdk 未配置"
+                  return sdkPath
+              }()
+              includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          plugins {
+              id "dev.flutter.flutter-plugin-loader" version "1.0.0"
+              id "com.android.application" version "8.1.0" apply false
+              id "org.jetbrains.kotlin.android" version "1.8.22" apply false
+          }
+          include ":app"
+          GRADLE
+          echo "::endgroup::"
+
+          echo "::group::② 补 build 输出目录，否则 flutter 找不到 APK"
+          cat >> android/build.gradle <<'GRADLE'
+
+          rootProject.buildDir = "../build"
+          subprojects {
+              project.buildDir = "${rootProject.buildDir}/${project.name}"
+          }
+          subprojects {
+              project.evaluationDependsOn(":app")
+          }
+          tasks.register("clean", Delete) {
+              delete rootProject.buildDir
+          }
+          GRADLE
+          echo "::endgroup::"
+
+          echo "::group::③ 补 INTERNET 权限，否则 release 包完全没网"
+          if ! grep -q 'permission.INTERNET' android/app/src/main/AndroidManifest.xml; then
+            sed -i '1a\    <uses-permission android:name="android.permission.INTERNET"/>' android/app/src/main/AndroidManifest.xml
+          fi
+          head -5 android/app/src/main/AndroidManifest.xml
+          echo "::endgroup::"
+
+      - name: 安装依赖
+        run: flutter pub get
+
+      - name: 补齐 Gradle wrapper
+        run: |
+          echo "flutter.sdk=$FLUTTER_ROOT" > android/local.properties
+          if [ ! -f android/gradlew ]; then
+            echo "gradlew 缺失，用 gradle 生成"
+            (cd android && gradle wrapper --gradle-version 8.3 --no-daemon) \
+              || echo "::warning::生成失败，交给 flutter 工具自行注入"
+          fi
+          chmod +x android/gradlew || true
+          ls -l android/gradlew || true
+
+      - name: 打包 APK
+        run: flutter build apk --release
+
+      - name: 检查产物
+        run: |
+          echo "=== 找到的 APK ==="
+          find build/app/outputs/flutter-apk -name '*.apk' -exec ls -lh {} \;
+          test -n "$(find build/app/outputs/flutter-apk -name '*.apk' | head -n 1)"
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: 黄果短剧-APK
+          path: build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 30
